@@ -146,13 +146,22 @@ def make_video(items, title, out_path, workdir, already_vertical=False):
     elif title:
         log('⚠️ ไม่พบฟอนต์ไทย — ข้ามข้อความหัวเรื่อง')
 
-    for crf in (23, 28, 32):
-        run(['ffmpeg', '-y', '-v', 'error', '-i', joined, '-vf', vf,
-             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(crf), '-pix_fmt', 'yuv420p',
-             '-r', str(FPS), '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-t', str(MAX_SECONDS),
-             str(out_path)])
+    # รอบแรกใช้คุณภาพคงที่ (crf 23) ถ้าใหญ่เกิน → คุมบิตเรตให้พอดี 24MB
+    # (คลิปถ่ายจริงที่ภาพละเอียด/กล้องสั่น เช่น เดินป่า crf 32 ยังเกิน 24MB)
+    jdur = min(probe(joined)['duration'] or MAX_SECONDS, MAX_SECONDS)
+    common_in = ['ffmpeg', '-y', '-v', 'error', '-i', joined, '-vf', vf]
+    common_out = ['-pix_fmt', 'yuv420p', '-r', str(FPS), '-c:a', 'aac', '-b:a', '128k',
+                  '-movflags', '+faststart', '-t', str(MAX_SECONDS), str(out_path)]
+    cap = int(MAX_BYTES * 8 * 0.85 / jdur / 1000) - 128
+    # รอบแรก: crf 23 แต่มีเพดานบิตเรต — คลิปง่ายได้คุณภาพดี คลิปยากไม่เกินขนาด ในรอบเดียว
+    attempts = [['-crf', '23', '-maxrate', f'{cap}k', '-bufsize', f'{cap*2}k']]
+    for margin in (0.70, 0.55):
+        kbps = int(MAX_BYTES * 8 * margin / jdur / 1000) - 128
+        attempts.append(['-b:v', f'{kbps}k', '-maxrate', f'{int(kbps*1.2)}k', '-bufsize', f'{kbps*2}k'])
+    for rate in attempts:
+        run(common_in + ['-c:v', 'libx264', '-preset', 'veryfast'] + rate + common_out)
         size = os.path.getsize(out_path)
-        log(f'ไฟล์ผลลัพธ์ {size/1048576:.1f}MB (crf {crf})')
+        log(f'ไฟล์ผลลัพธ์ {size/1048576:.1f}MB ({" ".join(rate[:2])})')
         if size <= MAX_BYTES:
             break
     else:
