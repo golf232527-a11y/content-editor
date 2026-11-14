@@ -1,0 +1,28 @@
+name: selftest
+
+# ทดสอบว่าเครื่องมือสร้างวิดีโอใช้ได้ (รูป AI + เสียงพากย์ไทย + ซับ) โดยไม่ต่อกับบอท
+on:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: ติดตั้ง
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-thai-tlwg >/dev/null
+          pip install -q edge-tts gTTS
+      - name: สร้างวิดีโอทดสอบ
+        run: python3 edit.py --gen test/script.json selftest.mp4
+      - name: ตรวจผล
+        run: ffprobe -v error -show_entries stream=codec_name,width,height:format=duration,size -of compact selftest.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selftest-video
+          path: |
+            selftest.mp4
+            selftest.jpg
+          retention-days: 3
