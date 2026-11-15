@@ -317,6 +317,251 @@ def generate_video(script, out_path, workdir):
     return thumb, dur, {'scenes': len(parts), 'ai_images': ai_ok, 'voice': voice_ok}
 
 
+# ---------- v15: ตัดต่อคลิปที่ถ่ายเองให้น่าดู ----------
+# ย่อเป็นไฮไลต์ 15–30 วิ (เลือกช่วงที่ภาพเคลื่อนไหวดี กระจายตั้งแต่ต้นจนจบ) → ปรับสี
+# → AI ดูภาพตัวอย่างแล้วเขียนชื่อเรื่อง/คำพากย์/แคปชันฮาๆ → พากย์ไทย + ซับ (เสียงเดิมเบาลง)
+SOURCE_MAX = 180          # อ่านคลิปต้นฉบับได้ยาวสุดกี่วินาที (ไว้เลือกไฮไลต์)
+HL_TRIGGER = 30           # ยาวกว่านี้ค่อยย่อ
+HL_TARGET = 24            # ความยาวไฮไลต์
+SEG = 3.0                 # ความยาวแต่ละช่วงที่ตัดมาต่อ
+COLOR = 'eq=saturation=1.22:contrast=1.06:brightness=0.015:gamma=1.02,unsharp=5:5:0.4:5:5:0.0'
+ORIG_VOL_WITH_VOICE = 0.22
+
+
+def build_joined(items, workdir, max_total):
+    parts, total = [], 0.0
+    for i, it in enumerate(items):
+        remain = max_total - total
+        if remain < 0.5:
+            break
+        dst = os.path.join(workdir, f'part{i:02d}.mp4')
+        if it['type'] == 'video':
+            total += normalize_video(it['path'], dst, remain)
+        else:
+            total += normalize_image(it['path'], dst, min(IMAGE_SECONDS, remain))
+        parts.append(dst)
+    if not parts:
+        raise RuntimeError('ไม่มีไฟล์ให้ตัดต่อ')
+    listfile = os.path.join(workdir, 'list.txt')
+    with open(listfile, 'w') as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
+    joined = os.path.join(workdir, 'joined.mp4')
+    run(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i', listfile, '-c', 'copy', joined])
+    return joined
+
+
+def motion_scores(path):
+    """ค่าการเปลี่ยนแปลงของภาพ ~5 ครั้งต่อวินาที (ภาพนิ่ง = ต่ำ, กล้องสะบัดแรง = สูงมาก)"""
+    p = subprocess.run(['ffmpeg', '-v', 'error', '-i', path, '-vf',
+                        'fps=5,scale=160:-2,tblend=all_mode=difference,signalstats,'
+                        'metadata=print:key=lavfi.signalstats.YAVG:file=-',
+                        '-an', '-f', 'null', '-'], capture_output=True, text=True)
+    vals = []
+    for line in p.stdout.splitlines():
+        if 'YAVG=' in line:
+            try:
+                vals.append(float(line.split('YAVG=')[1]))
+            except ValueError:
+                pass
+    return vals  # index i ≈ เวลา i/5 วินาที
+
+
+def pick_segments(scores, duration, target=HL_TARGET, seg=SEG):
+    """แบ่งคลิปเป็นช่วงๆ เท่ากัน แต่ละช่วงเลือกหน้าต่าง seg วินาทีที่ดีที่สุด → เรื่องยังเดินจากต้นถึงจบ
+    คะแนน: ภาพที่ขยับพอดีดีที่สุด — นิ่งเกินหรือสะบัดแรงเกิน (บนสุด 10%) ถูกหักคะแนน"""
+    n = max(1, int(round(target / seg)))
+    if not scores or duration <= target + 0.5:
+        return [(0.0, duration)]
+    srt = sorted(scores)
+    p90 = srt[int(len(srt) * 0.9) - 1] if len(srt) > 10 else srt[-1]
+    adj = [v if v <= p90 else max(0.0, p90 - (v - p90)) for v in scores]
+    rate = len(scores) / max(duration, 0.1)
+    win = max(1, int(seg * rate))
+    bucket = duration / n
+    out = []
+    for b in range(n):
+        lo, hi = b * bucket, min(duration, (b + 1) * bucket)
+        best, best_t = -1.0, lo
+        t = lo
+        while t + seg <= hi + 1e-6:
+            i0 = int(t * rate)
+            chunk = adj[i0:i0 + win]
+            sc = sum(chunk) / len(chunk) if chunk else 0.0
+            if sc > best:
+                best, best_t = sc, t
+            t += 0.5
+        if hi - lo < seg:  # ช่วงสั้นกว่าหน้าต่าง → เอาทั้งช่วง
+            best_t = lo
+        out.append((round(best_t, 2), round(min(best_t + seg, duration), 2)))
+    # ตัดช่วงซ้อนทับ
+    merged = []
+    for a, b in out:
+        if merged and a < merged[-1][1]:
+            a = merged[-1][1]
+        if b - a >= 1.0:
+            merged.append((a, b))
+    return merged or [(0.0, min(duration, target))]
+
+
+def cut_segments(src, segs, dst):
+    if len(segs) == 1 and segs[0][0] == 0:
+        run(['ffmpeg', '-y', '-v', 'error', '-i', src, '-t', f'{segs[0][1]:.3f}', '-c', 'copy', dst])
+        return
+    fc, labels = [], ''
+    for i, (a, b) in enumerate(segs):
+        fc.append(f'[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS[v{i}]')
+        fc.append(f'[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,afade=t=in:d=0.08,'
+                  f'afade=t=out:st={max(0, b - a - 0.08):.2f}:d=0.08[a{i}]')
+        labels += f'[v{i}][a{i}]'
+    fc.append(f'{labels}concat=n={len(segs)}:v=1:a=1[v][a]')
+    run(['ffmpeg', '-y', '-v', 'error', '-i', src, '-filter_complex', ';'.join(fc),
+         '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+         '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2', dst])
+
+
+def sample_frames(src, duration, n=4):
+    """ภาพตัวอย่างเล็กๆ ส่งให้ AI ดู (base64 jpeg)"""
+    import base64
+    out = []
+    for k in range(n):
+        t = duration * (k + 0.5) / n
+        p = f'{src}.f{k}.jpg'
+        try:
+            run(['ffmpeg', '-y', '-v', 'error', '-ss', f'{t:.2f}', '-i', src, '-frames:v', '1',
+                 '-vf', 'scale=432:768', '-q:v', '6', p])
+            with open(p, 'rb') as f:
+                out.append(base64.b64encode(f.read()).decode())
+        except Exception as e:
+            log('  ดึงภาพตัวอย่างไม่ได้:', str(e)[-120:])
+    return out
+
+
+def narration_track(lines, duration, workdir):
+    """สร้างเสียงพากย์ทีละประโยค วางต่อกัน คืน (ไฟล์เสียงรวม, [(เริ่ม, จบ, ข้อความ)])"""
+    clips = []
+    for i, text in enumerate(lines):
+        aud = os.path.join(workdir, f'nar{i:02d}.mp3')
+        d = tts(text, aud)
+        if d:
+            clips.append((aud, d, text))
+    # ตัดประโยคท้ายๆ ทิ้งถ้ารวมแล้วยาวเกินคลิป
+    while clips and 0.6 + sum(c[1] for c in clips) + 0.35 * (len(clips) - 1) > duration - 0.3:
+        log(f'  ตัดคำพากย์ที่เกินความยาวคลิป: {clips[-1][2]}')
+        clips.pop()
+    # กระจายประโยคให้ทั่วคลิป (ประโยคสุดท้ายจบใกล้ท้ายคลิป) แทนที่จะพูดรวดเดียวช่วงต้น
+    t, cues, inputs = 0.6, [], []
+    slot = (duration - 0.6) / max(1, len(clips))
+    for i, (aud, d, text) in enumerate(clips):
+        remaining = sum(c[1] + 0.35 for c in clips[i:])
+        start = max(t, min(0.6 + i * slot, duration - 0.3 - remaining + 0.35))
+        cues.append((start, start + d, text))
+        inputs.append((aud, start))
+        t = start + d + 0.35
+    if not inputs:
+        return None, []
+    cmd = ['ffmpeg', '-y', '-v', 'error']
+    for aud, _ in inputs:
+        cmd += ['-i', aud]
+    fc = ';'.join(f'[{i}:a]aresample=44100,aformat=channel_layouts=stereo,adelay={int(st*1000)}:all=1[n{i}]'
+                  for i, (_, st) in enumerate(inputs))
+    fc += ';' + ''.join(f'[n{i}]' for i in range(len(inputs))) + \
+        f'amix=inputs={len(inputs)}:normalize=0,apad,atrim=0:{duration:.3f}[out]'
+    out = os.path.join(workdir, 'narration.m4a')
+    run(cmd + ['-filter_complex', fc, '-map', '[out]', '-c:a', 'aac', '-b:a', '128k', out])
+    return out, cues
+
+
+def encode_capped(inputs, filter_complex, maps, out_path, duration):
+    """เข้ารหัส h264 ให้ไฟล์ไม่เกิน 24MB (crf 23 + เพดานบิตเรต → ถ้ายังเกินลดบิตเรต)"""
+    dur = max(1.0, min(duration, MAX_SECONDS))
+    cap = int(MAX_BYTES * 8 * 0.85 / dur / 1000) - 128
+    attempts = [['-crf', '23', '-maxrate', f'{cap}k', '-bufsize', f'{cap*2}k']]
+    for margin in (0.70, 0.55):
+        kbps = int(MAX_BYTES * 8 * margin / dur / 1000) - 128
+        attempts.append(['-b:v', f'{kbps}k', '-maxrate', f'{int(kbps*1.2)}k', '-bufsize', f'{kbps*2}k'])
+    for rate in attempts:
+        run(['ffmpeg', '-y', '-v', 'error', *inputs, '-filter_complex', filter_complex, *maps,
+             '-c:v', 'libx264', '-preset', 'veryfast', *rate, '-pix_fmt', 'yuv420p', '-r', str(FPS),
+             '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-t', f'{dur:.3f}', str(out_path)])
+        size = os.path.getsize(out_path)
+        log(f'ไฟล์ผลลัพธ์ {size/1048576:.1f}MB ({" ".join(rate[:2])})')
+        if size <= MAX_BYTES:
+            return
+    raise RuntimeError('ไฟล์ใหญ่เกิน 24MB แม้บีบอัดแล้ว')
+
+
+def no_emoji(text):
+    """ฟอนต์ไทยบนคลิปไม่มีอีโมจิ (จะขึ้นเป็นกล่องสี่เหลี่ยม) → ตัดทิ้ง"""
+    import re
+    t = re.sub('[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]', '', str(text or ''))
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def enhance_edit(items, title, out_path, workdir, script_fn=None):
+    """script_fn(duration, frames) -> {'title','caption','lines'} หรือ {} (ไม่มี AI)"""
+    joined = build_joined(items, workdir, SOURCE_MAX)
+    jdur = probe(joined)['duration']
+    stats = {'source_sec': round(jdur, 1)}
+    clip = joined
+    if jdur > HL_TRIGGER:
+        segs = pick_segments(motion_scores(joined), jdur)
+        clip = os.path.join(workdir, 'highlight.mp4')
+        cut_segments(joined, segs, clip)
+        stats['segments'] = len(segs)
+        log(f'  ไฮไลต์ {len(segs)} ช่วง: {segs}')
+    elif jdur > MAX_SECONDS:
+        clip = os.path.join(workdir, 'trim.mp4')
+        cut_segments(joined, [(0, MAX_SECONDS)], clip)
+    cdur = min(probe(clip)['duration'], MAX_SECONDS)
+    stats['out_sec'] = round(cdur, 1)
+
+    script = {}
+    if script_fn:
+        try:
+            script = script_fn(cdur, sample_frames(clip, cdur)) or {}
+        except Exception as e:
+            log('  ขอบทจาก AI ไม่สำเร็จ:', str(e)[-200:])
+    stats['script'] = script.get('source', 'none')
+    title = no_emoji(title or script.get('title') or '')
+    narr, cues = narration_track([no_emoji(x) for x in (script.get('lines') or [])], cdur, workdir)
+    stats['voice_lines'] = len(cues)
+
+    font = font_path()
+    vchain = f'[0:v]{COLOR}'
+    if font and title:
+        tf = os.path.join(workdir, 'title.txt')
+        with open(tf, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(wrap_thai(title[:40], width=18)[:2]))
+        vchain += (f",drawtext=fontfile='{font}':textfile='{tf}':fontsize=76:fontcolor=white:line_spacing=14:"
+                   f"box=1:boxcolor=black@0.55:boxborderw=28:x=(w-text_w)/2:y=h*0.11:"
+                   f"enable='lt(t,{TITLE_SECONDS})'")
+    if font:
+        for i, (a, b, text) in enumerate(cues):
+            sf = os.path.join(workdir, f'cue{i:02d}.txt')
+            with open(sf, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(wrap_thai(text, width=18)[:3]))
+            vchain += (f",drawtext=fontfile='{font}':textfile='{sf}':fontsize=62:fontcolor=white:line_spacing=16:"
+                       f"borderw=5:bordercolor=black@0.9:box=1:boxcolor=black@0.35:boxborderw=18:"
+                       f"x=(w-text_w)/2:y=h*0.70:enable='between(t,{a:.2f},{b:.2f})'")
+    elif title or cues:
+        log('⚠️ ไม่พบฟอนต์ไทย — ข้ามตัวหนังสือบนคลิป')
+    vchain += ',format=yuv420p,setsar=1[v]'
+    inputs = ['-i', clip]
+    if narr:
+        inputs += ['-i', narr]
+        achain = (f'[0:a]volume={ORIG_VOL_WITH_VOICE}[o];[1:a]volume=1.6[n];'
+                  f'[o][n]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.95[a]')
+    else:
+        achain = '[0:a]anull[a]'
+    encode_capped(inputs, vchain + ';' + achain, ['-map', '[v]', '-map', '[a]'], out_path, cdur)
+
+    thumb = os.path.join(workdir, 'thumb.jpg')
+    run(['ffmpeg', '-y', '-v', 'error', '-ss', '0.8', '-i', str(out_path), '-frames:v', '1',
+         '-vf', 'scale=540:960', '-q:v', '4', thumb])
+    return thumb, probe(out_path)['duration'], stats
+
+
 # ---------- ต่อกับ Worker ----------
 def oidc_token():
     url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=content-bot'
@@ -379,7 +624,11 @@ def process_job(job, token):
                 p = os.path.join(wd, f'src{i:02d}.{ext}')
                 download(m['url'], p)
                 items.append({'type': m['type'], 'path': p})
-            thumb, dur = make_video(items, job.get('title') or '', out, wd)
+            def script_fn(duration, frames):
+                body = json.dumps({'duration': round(duration, 1), 'frames': frames}).encode()
+                return api('POST', f'/edit/script?cid={cid}', token, body,
+                           {'Content-Type': 'application/json'}, timeout=120)
+            thumb, dur, stats = enhance_edit(items, job.get('title') or '', out, wd, script_fn)
         body, ctype = multipart({'duration': f'{dur:.1f}', 'stats': json.dumps(stats)},
                                 {'video': ('edited.mp4', 'video/mp4', out),
                                  'thumb': ('thumb.jpg', 'image/jpeg', thumb)})
@@ -427,6 +676,21 @@ if __name__ == '__main__':
             th, d, st = generate_video(sc, sys.argv[3], wd)
             os.replace(th, os.path.splitext(sys.argv[3])[0] + '.jpg')
         log(f'เสร็จ: {sys.argv[3]} ยาว {d:.1f}s {st}')
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == '--enhance':
+        # python edit.py --enhance script.json|- "ชื่อเรื่อง" out.mp4 file1 ...  (ทดสอบตัดต่อแบบใหม่ ไม่ต่อ Worker)
+        sj, ttl, outp, files = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+        fixed = {} if sj == '-' else json.load(open(sj, encoding='utf-8'))
+        its = [{'type': 'image' if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')) else 'video', 'path': f}
+               for f in files]
+        seen = {}
+        def fake(duration, frames):
+            seen.update(duration=duration, frames=len(frames))
+            return fixed
+        with tempfile.TemporaryDirectory() as wd:
+            th, d, st = enhance_edit(its, ttl, outp, wd, fake)
+            os.replace(th, os.path.splitext(outp)[0] + '.jpg')
+        log(f'เสร็จ: {outp} ยาว {d:.1f}s {st} ai_saw={seen}')
         sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == '--local':
         sys.exit(main_local(sys.argv[2:]))
