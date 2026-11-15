@@ -235,7 +235,8 @@ def tts(text, dst):
 
 
 def wrap_thai(text, width=16):
-    """ตัดบรรทัดซับไทย: เว้นวรรคก่อน ถ้าคำยาวเกินค่อยตัดตามตัวอักษร (ไม่แยกสระ/วรรณยุกต์ออกจากพยัญชนะ)"""
+    """ตัดบรรทัดซับไทยตามคำ (pythainlp) ไม่ตัดกลางคำ เช่น "ลืมเ|หนื่อย"
+    คำเดียวยาวเกินบรรทัดค่อยตัดตามตัวอักษร (ไม่แยกสระ/วรรณยุกต์ออกจากพยัญชนะ)"""
     import unicodedata
 
     def clusters(word):
@@ -247,19 +248,38 @@ def wrap_thai(text, width=16):
                 out.append(ch)
         return out
 
+    def words(chunk):
+        try:
+            from pythainlp.tokenize import word_tokenize
+            toks = [t for t in word_tokenize(chunk, engine='newmm', keep_whitespace=False) if t]
+            if toks:
+                # เครื่องหมายท้ายประโยค (! ? ฯ ๆ) ติดกับคำก่อนหน้า ไม่ขึ้นบรรทัดใหม่เดี่ยวๆ
+                merged = []
+                for t in toks:
+                    if merged and all(not ch.isalnum() or ch in 'ๆฯ' for ch in t):
+                        merged[-1] += t
+                    else:
+                        merged.append(t)
+                return merged
+        except Exception:
+            pass
+        return [chunk]
+
     lines, cur = [], []
-    for word in text.split():
-        cl = clusters(word)
-        if cur and len(cur) + 1 + len(cl) > width:
-            lines.append(''.join(cur)); cur = []
-        if cur:
-            cur.append(' ')
-        cur.extend(cl)
-        while len(cur) > width:
-            lines.append(''.join(cur[:width])); cur = cur[width:]
+    for chunk in text.split():
+        first = True
+        for w in words(chunk):
+            cl = clusters(w)
+            sep = [' '] if (first and cur) else []
+            if cur and len(cur) + len(sep) + len(cl) > width:
+                lines.append(''.join(cur).strip()); cur = []; sep = []
+            cur.extend(sep + cl)
+            first = False
+            while len(cur) > width:
+                lines.append(''.join(cur[:width]).strip()); cur = cur[width:]
     if cur:
-        lines.append(''.join(cur))
-    return lines[:4]
+        lines.append(''.join(cur).strip())
+    return [ln for ln in lines if ln][:4]
 
 
 def scene_clip(img, audio, audio_dur, text, dst, workdir, idx):
