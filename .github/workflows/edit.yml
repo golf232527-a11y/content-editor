@@ -48,7 +48,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg fonts-thai-tlwg >/dev/null
-          pip install -q edge-tts gTTS
+          pip install -q edge-tts gTTS pythainlp
 
       - name: ตัดต่อ/สร้างวิดีโอ
         if: steps.check.outputs.count != '0'
